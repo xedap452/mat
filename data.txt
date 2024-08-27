@@ -1,0 +1,1 @@
+user=%7B%22id%22%3A1050826600%2C%22first_name%22%3A%22T%22%2C%22last_name%22%3A%22%22%2C%22username%22%3A%22lothiet%22%2C%22language_code%22%3A%22en%22%2C%22allows_write_to_pm%22%3Atrue%7D&chat_instance=4178376128298156878&chat_type=channel&start_param=6d4d6721331eaeb8a2d6dfcf55998473&auth_date=1724727089&hash=3a0637001b2d19b01e97a91cee64193f12ec2aab2d742e774c7834b063f735de
