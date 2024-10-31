@@ -1,10 +1,12 @@
 const axios = require('axios');
+const https = require('https');
 const { parse } = require('querystring');
 const { execSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const colors = require('colors');
 const { DateTime } = require('luxon');
+const minimist = require('minimist');
 
 const headers = {
     "host": "tgapp-api.matchain.io",
@@ -28,11 +30,19 @@ class Matchain {
     }
 
     async http(url, headers, data = null) {
+        const config = {
+            headers,
+            httpsAgent: new https.Agent({
+                rejectUnauthorized: false
+            })
+        };
+
         while (true) {
             try {
-                const res = data ? await axios.post(url, data, { headers }) : await axios.get(url, { headers });
+                const res = data ? await axios.post(url, data, config) : await axios.get(url, config);
                 return res;
             } catch (error) {
+                this.log(`HTTP request error: ${error.message}`, 'error');
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
         }
@@ -57,6 +67,46 @@ class Matchain {
         return parsedData;
     }
 
+    async completeQuiz() {
+        try {
+            const quizUrl = "https://tgapp-api.matchain.io/api/tgapp/v1/daily/quiz/progress";
+            let quizRes = await this.http(quizUrl, this.headers);
+            if (quizRes.status !== 200) {
+                this.log('Lỗi khi lấy câu hỏi quiz!', 'error');
+                return false;
+            }
+
+            const quizData = quizRes.data.data;
+            const answerResult = [];
+
+            for (const question of quizData) {
+                const correctAnswer = question.items.find(item => item.is_correct);
+                if (correctAnswer) {
+                    answerResult.push({
+                        quiz_id: question.Id,
+                        selected_item: correctAnswer.number,
+                        correct_item: correctAnswer.number
+                    });
+                }
+            }
+
+            const submitUrl = "https://tgapp-api.matchain.io/api/tgapp/v1/daily/quiz/submit";
+            const payload = JSON.stringify({ answer_result: answerResult });
+            let submitRes = await this.http(submitUrl, this.headers, payload);
+
+            if (submitRes.status === 200 && submitRes.data.code === 200) {
+                this.log('Trả lời câu hỏi quiz thành công!', 'success');
+                return true;
+            } else {
+                this.log('Lỗi khi gửi câu trả lời quiz!', 'error');
+                return false;
+            }
+        } catch (error) {
+            this.log(`Hôm nay bạn đã trả lời câu hỏi rồi!`, 'error');
+            return false;
+        }
+    }
+    
     async login(data) {
         const parser = this.dancay(data);
         const userEncoded = decodeURIComponent(parser['user']);
@@ -102,7 +152,31 @@ class Matchain {
     
         const balance = res.data.data;
         this.log(`Balance: ${balance / 1000}`, 'info');
-    
+        
+        const quizResult = await this.completeQuiz();
+        if (quizResult) {
+            this.log('Hoàn thành quiz hàng ngày', 'success');
+        } else {
+            this.log('Không thể hoàn thành quiz hàng ngày', 'warning');
+        }
+        
+        const taskStatus = await this.checkDailyTaskStatus();
+        if (taskStatus) {
+            if (taskStatus.dailyNeedsPurchase) {
+                try {
+                    const boosterResult = await this.buyBooster(token, this.userid);
+                    if (boosterResult.code === 400) {
+                        this.log('Bạn đã thực hiện mua booster trước đó, thử lại sau!', 'warning');
+                    } else if (boosterResult) {
+                        this.log('Mua thành công Daily Booster', 'success');
+                    }
+                } catch (error) {
+                    console.error('Error buying booster:', error);
+                    this.log('Lỗi khi mua Daily Booster', 'error');
+                }
+            }
+        }
+        
         let next_claim = 0;
         while (true) {
             const rewardUrl = "https://tgapp-api.matchain.io/api/tgapp/v1/point/reward";
@@ -113,7 +187,6 @@ class Matchain {
             }
     
             next_claim = res.data.data.next_claim_timestamp;
-            console.log(next_claim);
             if (next_claim === 0) {
                 const farmingUrl = "https://tgapp-api.matchain.io/api/tgapp/v1/point/reward/farming";
                 res = await this.http(farmingUrl, this.headers, JSON.stringify({ "uid": this.userid }));
@@ -141,47 +214,59 @@ class Matchain {
             const _data = res.data.data;
             this.log('Phần thưởng đã được nhận thành công', 'success');
             this.log(`Balance: ${balance + _data}`, 'info');
-            break;
         }
     
-        const taskNames = await this.getTaskList(user['id']);
-        for (let taskType of taskNames) {
-            await this.completeTask(user['id'], taskType);
+        await this.processTasks(this.userid);
+    
+        const updatedTaskStatus = await this.checkDailyTaskStatus();
+        if (updatedTaskStatus && updatedTaskStatus.gameNeedsPurchase) {
+            const ticketResult = await this.buyTicket(token, this.userid);
+            if (ticketResult) {
+                this.log('Mua thành công Game Ticket', 'success');
+            }
         }
     
+        const gameRuleUrl = "https://tgapp-api.matchain.io/api/tgapp/v1/game/rule";
+        let gameRuleRes = await this.http(gameRuleUrl, this.headers);
+        if (gameRuleRes.status !== 200) {
+            this.log('Lỗi khi lấy thông tin trò chơi!', 'error');
+            return false;
+        }
+
+        let gameCount = gameRuleRes.data.data.game_count;
+        this.log(`Số lượt chơi còn lại: ${gameCount}`, 'info');
+
         const gameUrl = "https://tgapp-api.matchain.io/api/tgapp/v1/game/play";
-        while (true) {
-            res = await this.http(gameUrl, this.headers);
+        while (gameCount > 0) {
+            let res = await this.http(gameUrl, this.headers);
             if (res.status !== 200) {
                 this.log('Lỗi bắt đầu trò chơi!', 'error');
                 return false;
             }
-    
+
             const game_id = res.data.data.game_id;
-            const game_count = res.data.data.game_count;
-            this.log(`Vé trò chơi: ${game_count}`, 'info');
-            if (game_count <= 0) {
-                this.log('Không còn vé trò chơi!', 'warning');
-                break; 
-            }
-    
+            this.log(`Bắt đầu trò chơi ID: ${game_id}`, 'info');
+
             await this.countdown(30);
             const point = Math.floor(Math.random() * (150 - 100 + 1)) + 100;
             const payload = JSON.stringify({ "game_id": game_id, "point": point });
             const url_claim = "https://tgapp-api.matchain.io/api/tgapp/v1/game/claim";
             res = await this.http(url_claim, this.headers, payload);
             if (res.status !== 200) {
-                this.log('Không thể bắt đầu trò chơi!', 'error');
+                this.log('Không thể kết thúc trò chơi!', 'error');
                 continue;
             }
-    
-            this.log(`Hoàn thành trò chơi, kếm được: ${point}`, 'success');
+
+            this.log(`Hoàn thành trò chơi, kiếm được: ${point}`, 'success');
+            gameCount--;
+            this.log(`Số lượt chơi còn lại: ${gameCount}`, 'info');
         }
-    
+
+        this.log('Đã hết lượt chơi!', 'warning');
+
         return Math.round(next_claim / 1000 - Date.now() / 1000) + 30;
     }
     
-
     load_data(file) {
         const data = fs.readFileSync(file, 'utf-8')
             .split('\n')
@@ -208,59 +293,149 @@ class Matchain {
 
         const data = res.data.data;
 
-        if (!data || !Array.isArray(data.Tasks)) {
+        if (!data) {
             this.log('Dữ liệu không hợp lệ', 'error');
             return false;
         }
 
-        const extraTasks = Array.isArray(data['Extra Tasks']) ? data['Extra Tasks'] : [];
-        const allTasks = [...data.Tasks, ...extraTasks];
-        const filteredTasks = allTasks.filter(task => task.complete === false && task.name !== "join_match_group");
-        const taskNames = filteredTasks.map(task => task.name);
-        return taskNames;
+        let allTasks = [];
+
+        ['Matchain Ecosystem', 'Tasks', 'Extra Tasks'].forEach(category => {
+            if (Array.isArray(data[category])) {
+                allTasks = allTasks.concat(data[category].map(task => ({
+                    ...task,
+                    category: category
+                })));
+            }
+        });
+
+        allTasks.sort((a, b) => a.sort - b.sort);
+
+        return allTasks;
     }
 
-    async completeTask(uid, taskType) {
+    async completeTask(uid, task) {
         const url = "https://tgapp-api.matchain.io/api/tgapp/v1/point/task/complete";
-        const payload = JSON.stringify({ "uid": uid, "type": taskType });
+        const payload = JSON.stringify({ "uid": uid, "type": task.name });
     
         let res = await this.http(url, this.headers, payload);
         if (res.status !== 200) {
-            this.log(`Lỗi khi hoàn thành nhiệm vụ ${taskType}! Status: ${res.status}`, 'error');
+            this.log(`Lỗi khi hoàn thành nhiệm vụ ${task.name}! Status: ${res.status}`, 'error');
             this.log(`Response: ${JSON.stringify(res.data)}`, 'error');
             return false;
         }
     
-        const rewardClaimed = await this.claimReward(uid, taskType);
+        const rewardClaimed = await this.claimReward(uid, task);
         return rewardClaimed;
     }
     
-    async claimReward(uid, taskType) {
+    async claimReward(uid, task) {
         const url = "https://tgapp-api.matchain.io/api/tgapp/v1/point/task/claim";
-        const payload = JSON.stringify({ "uid": uid, "type": taskType });
+        const payload = JSON.stringify({ "uid": uid, "type": task.name });
     
         let res = await this.http(url, this.headers, payload);
         if (res.status !== 200) {
-            this.log(`Lỗi khi nhận phần thưởng nhiệm vụ ${taskType}! Status: ${res.status}`, 'error');
-            this.log(`Response: ${JSON.stringify(res.data)}`, 'error');
+            this.log(`Lỗi khi nhận phần thưởng nhiệm vụ ${task.name}! Status: ${res.status}`, 'error');
             return false;
         }
     
         if (res.data.code === 200 && res.data.data === 'success') {
-            this.log(`${'Làm nhiệm vụ'.yellow} ${taskType.white} ... ${'Trạng thái:'.white} ${'Hoàn thành'.green}`);
+            this.log(`${'Làm nhiệm vụ'.yellow} ${task.name.white} ... ${'Trạng thái:'.white} ${'Hoàn thành'.green}`);
         } else {
-            this.log(`${'Làm nhiệm vụ'.yellow} ${taskType.white} ... ${'Trạng thái:'.white} ${'Thất bại'.red}`);
-            this.log(`Response: ${JSON.stringify(res.data)}`, 'error');
+            this.log(`${'Làm nhiệm vụ'.yellow} ${task.name.white} ... ${'Trạng thái:'.white} ${'Thất bại'.red}`);
             return false;
         }
     
         return true;
     }
-    
-    
+    async processTasks(uid) {
+        const allTasks = await this.getTaskList(uid);
+        if (!allTasks) {
+            this.log('Không thể lấy danh sách nhiệm vụ', 'error');
+            return;
+        }
+
+        for (const task of allTasks) {
+            if (!task.complete) {
+                await this.completeTask(uid, task);
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+    }
+
+    async buyTicket(token, userId) {
+        const url = 'https://tgapp-api.matchain.io/api/tgapp/v1/daily/task/purchase';
+        const headers = {
+            ...this.headers,
+            'Authorization': token
+        };
+        const payload = {
+            "uid": userId,
+            "type": "game"
+        };
+
+        try {
+            const response = await this.http(url, headers, JSON.stringify(payload));
+            return response.data;
+        } catch (error) {
+            if (error.response && error.response.status === 401) {
+                this.log("JSON Decode Error: Token Invalid", 'error');
+            } else {
+                this.log(`Request Error: ${error.message}`, 'error');
+            }
+            return null;
+        }
+    }
+
+    async buyBooster(token, userId) {
+        const url = 'https://tgapp-api.matchain.io/api/tgapp/v1/daily/task/purchase';
+        const headers = {
+            ...this.headers,
+            'Authorization': token
+        };
+        const payload = {
+            "uid": userId,
+            "type": "daily"
+        };
+
+        try {
+            const response = await this.http(url, headers, JSON.stringify(payload));
+            return response.data;
+        } catch (error) {
+            if (error.response && error.response.status === 401) {
+                this.log("JSON Decode Error: Token Invalid", 'error');
+            } else {
+                this.log(`Request Error: ${error.message}`, 'error');
+            }
+            return null;
+        }
+    }
+
+    async checkDailyTaskStatus() {
+        const url = "https://tgapp-api.matchain.io/api/tgapp/v1/daily/task/status";
+        try {
+            const response = await this.http(url, this.headers);
+            if (response.status !== 200 || !response.data || !response.data.data) {
+                this.log('Lỗi khi kiểm tra trạng thái nhiệm vụ hàng ngày', 'error');
+                return null;
+            }
+
+            const taskData = response.data.data;
+            const dailyTask = taskData.find(task => task.type === 'daily');
+            const gameTask = taskData.find(task => task.type === 'game');
+
+            return {
+                dailyNeedsPurchase: dailyTask && dailyTask.current_count < dailyTask.task_count,
+                gameNeedsPurchase: gameTask && gameTask.current_count < gameTask.task_count
+            };
+        } catch (error) {
+            this.log(`Lỗi khi kiểm tra trạng thái nhiệm vụ: ${error.message}`, 'error');
+            return null;
+        }
+    }
 
     async main() {
-        const args = require('minimist')(process.argv.slice(2));
+        const args = minimist(process.argv.slice(2));
         if (!args['--marin']) {
             if (os.platform() === 'win32') {
                 execSync('cls', { stdio: 'inherit' });
@@ -273,8 +448,9 @@ class Matchain {
         while (true) {
             const list_countdown = [];
             const start = Math.floor(Date.now() / 1000);
-            for (let [no, data] of this.load_data(args['--data'] || 'data.txt').entries()) {
-                const parser = this.dancay(data);
+            const data = this.load_data(args['--data'] || 'data.txt');
+            for (let [no, item] of data.entries()) {
+                const parser = this.dancay(item);
                 const userEncoded = decodeURIComponent(parser['user']);
                 let user;
                 try {
@@ -284,22 +460,25 @@ class Matchain {
                     continue;
                 }
                 console.log(`========== Tài khoản ${no + 1} | ${user['first_name'].green} ==========`);
-                const result = await this.login(data);
-                if (!result) continue;
-
-                list_countdown.push(result);
-                await this.countdown(3);
+                try {
+                    const result = await this.login(item);
+                    if (result) {
+                        list_countdown.push(result);
+                        await this.countdown(3);
+                    }
+                } catch (error) {
+                    this.log(`Lỗi xử lý tài khoản ${no + 1}: ${error.message}`, 'error');
+                }
             }
 
             const end = Math.floor(Date.now() / 1000);
             const total = end - start;
-            const positiveCountdowns = list_countdown.filter(time => time > total);
-            if (positiveCountdowns.length > 0) {
-                const min = Math.min(...positiveCountdowns) - total;
-                if (min > 0) {
-                    await this.countdown(min);
-                }
+            const min = Math.min(...list_countdown) - total;
+            if (min <= 0) {
+                continue;
             }
+
+            await this.countdown(min);
         }
     }
 
